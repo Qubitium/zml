@@ -208,6 +208,11 @@ pub const ReduceArgs = struct {
 };
 
 pub fn reduce(inputs: anytype, inits: anytype, axes_: []const i64, comptime func: anytype, context: anytype) stdx.meta.FnReturn(func) {
+    return reduceWithFrontendAttribute(inputs, inits, axes_, func, context, null);
+}
+
+/// Attach a semantic marker to a reduction when its caller owns that contract.
+pub fn reduceWithFrontendAttribute(inputs: anytype, inits: anytype, axes_: []const i64, comptime func: anytype, context: anytype, comptime attribute: ?[]const u8) stdx.meta.FnReturn(func) {
     const compiler = Compiler.current();
     const caller_scope = compiler.currentScope();
     const mlir_ctx = compiler.mlir_ctx;
@@ -269,6 +274,11 @@ pub fn reduce(inputs: anytype, inits: anytype, axes_: []const i64, comptime func
         .verify = true,
         .location = compiler.location,
     }).appendTo(caller_scope.block);
+    if (attribute) |name| {
+        reduce_op.setAttributeByName("mhlo.frontend_attributes", .dict(mlir_ctx, &.{
+            .named(mlir_ctx, name, .string(mlir_ctx, "1")),
+        }));
+    }
 
     // `stablehlo.reduce` drops axes. We want to avoid that to propagate tags.
     // So we need to broadcast the output of `stablehlo.reduce` to the input shapes.
