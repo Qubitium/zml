@@ -1,0 +1,297 @@
+diff --git a/xla/backends/autotuner/codegen_orchestrator.h b/xla/backends/autotuner/codegen_orchestrator.h
+--- a/xla/backends/autotuner/codegen_orchestrator.h
++++ b/xla/backends/autotuner/codegen_orchestrator.h
+@@ -43,6 +43,10 @@ class CodegenOrchestrator {
+     // TODO(b/519059655): Generalize and move to tuner.
+     // If true, do not allow compilation of cublas or rocblas configs.
+     bool exclude_cublas_config = false;
++    // Additional per-instruction backend policy. This is applied to candidate
++    // enumeration, default selection, compile/apply, and cached configs.
++    std::function<bool(const HloInstruction&, autotuner::Backend)>
++        allow_backend_fn = [](const HloInstruction&, autotuner::Backend) { return true; };
+   };
+ 
+   // TODO(b/444398084): Unify Cache::Config and CodegenOrchestrator::Config
+@@ -84,6 +88,10 @@ class CodegenOrchestrator {
+     return codegen_backends_;
+   }
+ 
++  bool IsBackendAllowed(const HloInstruction& instr,
++                        autotuner::Backend backend) const;
++
+  private:
+   CodegenOrchestrator(
+       std::vector<std::unique_ptr<CodegenBackend>> codegen_backends,
+diff --git a/xla/backends/autotuner/codegen_orchestrator.cc b/xla/backends/autotuner/codegen_orchestrator.cc
+--- a/xla/backends/autotuner/codegen_orchestrator.cc
++++ b/xla/backends/autotuner/codegen_orchestrator.cc
+@@ -58,6 +58,11 @@ CodegenOrchestrator::GetSupportedConfigs(const HloInstruction& instr) const {
+   std::vector<Config> configs;
+   for (auto& codegen_backend : codegen_backends_) {
++    if (!IsBackendAllowed(instr, codegen_backend->backend())) {
++      VLOG(3) << "Skipping disallowed backend " << codegen_backend->name()
++              << " for HLO " << instr.name();
++      continue;
++    }
+     absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
+         per_backend_configs = codegen_backend->GetSupportedConfigs(instr);
+     if (!per_backend_configs.ok()) {
+@@ -80,6 +85,10 @@ absl::StatusOr<CodegenOrchestrator::Config>
+ CodegenOrchestrator::GetDefaultConfig(const HloInstruction& instr) const {
+   for (auto& backend : codegen_backends_) {
++    if (!IsBackendAllowed(instr, backend->backend())) {
++      VLOG(3) << "Skipping disallowed backend " << backend->name()
++              << " for HLO " << instr.name();
++      continue;
++    }
+     auto config = backend->GetDefaultConfig(instr);
+     if (config.ok()) {
+       return Config{backend.get(), std::move(*config)};
+@@ -91,6 +100,11 @@ absl::StatusOr<CodegenOrchestrator::Config>
+ 
+ absl::StatusOr<std::unique_ptr<Executable>> CodegenOrchestrator::Compile(
+     const HloInstruction& instr, const Config& config) const {
++  if (!IsBackendAllowed(instr, config.codegen_backend->backend())) {
++    return absl::PermissionDeniedError(absl::StrCat(
++        "Backend-selection policy disallows config ", config.ToString(),
++        " for HLO ", instr.name()));
++  }
+   if (options_.exclude_cublas_config &&
+       (config.codegen_backend->backend() ==
+            autotuner::Backend::CUBLASLT_FISSION ||
+@@ -132,8 +146,20 @@ CodegenOrchestrator::CompileAll(const HloInstruction& instr,
+ 
+ absl::Status CodegenOrchestrator::ApplyConfig(HloInstruction& instr,
+                                               const Config& config) const {
++  if (!IsBackendAllowed(instr, config.codegen_backend->backend())) {
++    return absl::PermissionDeniedError(absl::StrCat(
++        "Backend-selection policy disallows config ", config.ToString(),
++        " for HLO ", instr.name()));
++  }
+   return config.codegen_backend->ApplyConfig(instr, *config.backend_config);
+ }
+ 
++bool CodegenOrchestrator::IsBackendAllowed(
++    const HloInstruction& instr, autotuner::Backend backend) const {
++  return !options_.allow_backend_fn ||
++         options_.allow_backend_fn(instr, backend);
++}
++
+ absl::Status CodegenOrchestrator::IsValidExecutable(
+     const absl::StatusOr<std::unique_ptr<Executable>>& executable,
+     const HloInstruction& instr) const {
+diff --git a/xla/backends/autotuner/config_assigner.cc b/xla/backends/autotuner/config_assigner.cc
+--- a/xla/backends/autotuner/config_assigner.cc
++++ b/xla/backends/autotuner/config_assigner.cc
+@@ -433,6 +433,14 @@ std::optional<ConfigAssigner::Config> ConfigAssigner::LookUp(
+   if (!cached_config.has_value()) {
+     return std::nullopt;
+   }
++  if (!orchestrator_->IsBackendAllowed(*instr,
++                                       cached_config->codegen_backend)) {
++    LOG(WARNING) << "Ignoring cached config from backend "
++                 << Backend_Name(cached_config->codegen_backend)
++                 << " for HLO '" << instr->ToString()
++                 << "' because the backend-selection policy disallows it.";
++    return std::nullopt;
++  }
+   VLOG(1) << "Found cached config for HLO: " << instr->ToString();
+   for (const auto& codegen_backend : orchestrator_->codegen_backends()) {
+     if (codegen_backend->backend() == cached_config->codegen_backend) {
+diff --git a/xla/service/gpu/autotuning/autotuner_pass.cc b/xla/service/gpu/autotuning/autotuner_pass.cc
+--- a/xla/service/gpu/autotuning/autotuner_pass.cc
++++ b/xla/service/gpu/autotuning/autotuner_pass.cc
+@@ -107,6 +107,65 @@ AutotuneDecision AllowRegSpillsForGpuInstruction(
+   return AutotuneDecision::Allow();
+ }
+ 
++// RMSNorm can be split by fusion formation so the reduction fusion no longer
++// contains the rsqrt/scale consumers. Match the stable structural anchor:
++// activation -> F32 -> square -> reduce over the final hidden dimension.
++//
++// NativeEmitter and BlockLevelEmitter use different reduction trees. For this
++// pattern, keep NativeEmitter out of the candidate set so RMSNorm uses the
++// block-level path with the validated numerical behavior.
++bool IsRmsNormReductionFusion(const HloInstruction& instruction) {
++  if (instruction.opcode() != HloOpcode::kFusion) {
++    return false;
++  }
++
++  const auto* fusion = Cast<const HloFusionInstruction>(&instruction);
++  const HloComputation* fused_computation =
++      fusion->fused_instructions_computation();
++  if (fused_computation == nullptr) {
++    return false;
++  }
++
++  for (const HloInstruction* fused_instruction :
++       fused_computation->instructions()) {
++    if (fused_instruction->opcode() != HloOpcode::kReduce ||
++        fused_instruction->operand_count() < 1 ||
++        fused_instruction->shape().element_type() != PrimitiveType::F32 ||
++        fused_instruction->dimensions().empty() ||
++        fused_instruction->operand(0)->opcode() != HloOpcode::kMultiply) {
++      continue;
++    }
++
++    const HloInstruction* square = fused_instruction->operand(0);
++    if (square->operand_count() != 2 ||
++        square->operand(0) != square->operand(1)) {
++      continue;
++    }
++
++    const HloInstruction* square_input = square->operand(0);
++    const HloInstruction* activation = square_input;
++    if (square_input->opcode() == HloOpcode::kConvert) {
++      if (square_input->shape().element_type() != PrimitiveType::F32 ||
++          square_input->operand_count() != 1) {
++        continue;
++      }
++      activation = square_input->operand(0);
++    }
++
++    if (!activation->shape().IsArray() ||
++        activation->shape().dimensions_size() < 1 ||
++        (activation->shape().element_type() != PrimitiveType::F16 &&
++         activation->shape().element_type() != PrimitiveType::BF16 &&
++         activation->shape().element_type() != PrimitiveType::F32) ||
++        square_input->shape().element_type() != PrimitiveType::F32 ||
++        square_input->shape().dimensions_size() !=
++            activation->shape().dimensions_size()) {
++      continue;
++    }
++
++    const int64_t hidden_axis = activation->shape().dimensions_size() - 1;
++    if (absl::c_linear_search(fused_instruction->dimensions(), hidden_axis)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ AutotuneDecision ShouldAutotuneCustomCall(bool do_not_autotune_cublas,
+                                           bool do_not_autotune_cudnn,
+                                           const HloInstruction& instruction) {
+@@ -247,6 +306,15 @@ CodegenOrchestrator::Options GetCodegenOrchestratorOptions(
+     const DebugOptions& debug_options) {
+   CodegenOrchestrator::Options options;
+   options.exclude_cublas_config = !debug_options.xla_gpu_cublas_fallback();
++  options.allow_backend_fn =
++      [](const HloInstruction& instruction, autotuner::Backend backend) {
++        if (backend == autotuner::Backend::NATIVE_EMITTER &&
++            IsRmsNormReductionFusion(instruction)) {
++          VLOG(2) << "Disallowing NativeEmitter for RMSNorm reduction HLO: "
++                  << instruction.name();
++          return false;
++        }
++        return true;
++      };
+   if (!debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling()) {
+     options.allow_reg_spills_fn = [](const HloInstruction& instr) {
+       return static_cast<bool>(AllowRegSpillsForGpuInstruction(instr));
+diff --git a/xla/service/gpu/autotuning/autotuner_pass_test.cc b/xla/service/gpu/autotuning/autotuner_pass_test.cc
+--- a/xla/service/gpu/autotuning/autotuner_pass_test.cc
++++ b/xla/service/gpu/autotuning/autotuner_pass_test.cc
+@@ -494,6 +494,114 @@ TEST_P(AutotunerRegSpillsTest, RegSpills) {
+             params.expected_allow_reg_spills_out);
+ }
+ 
++TEST_F(AutotunerFlagsTest,
++       DeepSeekV41RmsNormDisallowsNativeEmitterButAllowsBlockLevel) {
++  // Real DeepSeek V4.1 Flash RMSNorm geometry:
++  //   dtype=BF16, hidden_size=5120, rms_norm_eps=1e-20.
++  // The model performs square/mean/rsqrt and weight multiplication in FP32,
++  // then rounds the completed normalization back to BF16.
++  constexpr absl::string_view kDeepSeekV41RmsNormHlo = R"hlo(
++HloModule deepseek_v41_rmsnorm
++
++add {
++  lhs = f32[] parameter(0)
++  rhs = f32[] parameter(1)
++  ROOT sum = f32[] add(lhs, rhs)
++}
++
++rmsnorm {
++  hidden = bf16[1,1,5120]{2,1,0} parameter(0)
++  weight = bf16[5120]{0} parameter(1)
++  hidden_f32 = f32[1,1,5120]{2,1,0} convert(hidden)
++  square = f32[1,1,5120]{2,1,0} multiply(hidden_f32, hidden_f32)
++  zero = f32[] constant(0)
++  sum = f32[1,1]{1,0} reduce(square, zero), dimensions={2}, to_apply=add
++  mean_scale = f32[] constant(0.0001953125)
++  mean_scale_b = f32[1,1]{1,0} broadcast(mean_scale), dimensions={}
++  mean = f32[1,1]{1,0} multiply(sum, mean_scale_b)
++  eps = f32[] constant(1e-20)
++  eps_b = f32[1,1]{1,0} broadcast(eps), dimensions={}
++  variance_eps = f32[1,1]{1,0} add(mean, eps_b)
++  inv_rms = f32[1,1]{1,0} rsqrt(variance_eps)
++  inv_rms_b = f32[1,1,5120]{2,1,0} broadcast(inv_rms), dimensions={0,1}
++  normalized = f32[1,1,5120]{2,1,0} multiply(hidden_f32, inv_rms_b)
++  weight_f32 = f32[5120]{0} convert(weight)
++  weight_b = f32[1,1,5120]{2,1,0} broadcast(weight_f32), dimensions={2}
++  weighted = f32[1,1,5120]{2,1,0} multiply(normalized, weight_b)
++  ROOT out = bf16[1,1,5120]{2,1,0} convert(weighted)
++}
++
++ENTRY main {
++  hidden = bf16[1,1,5120]{2,1,0} parameter(0)
++  weight = bf16[5120]{0} parameter(1)
++  ROOT fusion = bf16[1,1,5120]{2,1,0} fusion(hidden, weight),
++      kind=kInput, calls=rmsnorm
++}
++)hlo";
++
++  TF_ASSERT_OK_AND_ASSIGN(
++      std::unique_ptr<HloModule> module,
++      ParseAndReturnVerifiedModule(kDeepSeekV41RmsNormHlo));
++  const HloInstruction* fusion =
++      module->entry_computation()->root_instruction();
++  auto options = GetCodegenOrchestratorOptions(GetDebugOptionsForTest());
++
++  EXPECT_FALSE(options.allow_backend_fn(
++      *fusion, autotuner::Backend::NATIVE_EMITTER));
++  EXPECT_TRUE(options.allow_backend_fn(
++      *fusion, autotuner::Backend::BLOCK_LEVEL_EMITTER));
++}
++
++TEST_F(AutotunerFlagsTest, NonRmsNormFinalDimensionReductionAllowsNativeEmitter) {
++  // Same real-world BF16 [1,1,5120] geometry, but no square. This guards
++  // against turning the policy into a blanket ban on final-dimension reduces.
++  constexpr absl::string_view kPlainReductionHlo = R"hlo(
++HloModule non_rmsnorm_reduce
++
++add {
++  lhs = f32[] parameter(0)
++  rhs = f32[] parameter(1)
++  ROOT sum = f32[] add(lhs, rhs)
++}
++
++plain_reduce {
++  hidden = bf16[1,1,5120]{2,1,0} parameter(0)
++  hidden_f32 = f32[1,1,5120]{2,1,0} convert(hidden)
++  zero = f32[] constant(0)
++  ROOT sum = f32[1,1]{1,0} reduce(hidden_f32, zero),
++      dimensions={2}, to_apply=add
++}
++
++ENTRY main {
++  hidden = bf16[1,1,5120]{2,1,0} parameter(0)
++  ROOT fusion = f32[1,1]{1,0} fusion(hidden),
++      kind=kInput, calls=plain_reduce
++}
++)hlo";
++
++  TF_ASSERT_OK_AND_ASSIGN(
++      std::unique_ptr<HloModule> module,
++      ParseAndReturnVerifiedModule(kPlainReductionHlo));
++  const HloInstruction* fusion =
++      module->entry_computation()->root_instruction();
++  auto options = GetCodegenOrchestratorOptions(GetDebugOptionsForTest());
++
++  EXPECT_TRUE(options.allow_backend_fn(
++      *fusion, autotuner::Backend::NATIVE_EMITTER));
++}
++
+ INSTANTIATE_TEST_SUITE_P(
+     RegSpillsTests, AutotunerRegSpillsTest,
+     ::testing::ValuesIn<RegSpillsParams>({
