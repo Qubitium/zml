@@ -800,12 +800,17 @@ fn compileModuleToPjrtExecutable(arena: std.mem.Allocator, io: std.Io, platform:
             // artificial limit get a zero-byte temporary-memory budget and
             // can trigger excessive rematerialization.
             var device_memory_size: ?u64 = null;
-            for (platform.devices) |device| {
-                const bytes_limit = device.memoryStats().bytes_limit orelse {
-                    device_memory_size = null;
-                    break;
-                };
-                device_memory_size = @min(device_memory_size orelse bytes_limit, bytes_limit);
+            // PJRT CPU does not implement allocator memory statistics. The
+            // override is GPU-specific; querying CPU only logs an error and
+            // makes otherwise successful Zig test suites fail.
+            if (platform.target == .cuda or platform.target == .rocm) {
+                for (platform.devices) |device| {
+                    const bytes_limit = device.memoryStats().bytes_limit orelse {
+                        device_memory_size = null;
+                        break;
+                    };
+                    device_memory_size = @min(device_memory_size orelse bytes_limit, bytes_limit);
+                }
             }
             if (device_memory_size) |bytes_limit| {
                 c.xla_ExecutableBuildOptionsProto_set_device_memory_size(exec_build_options, @intCast(bytes_limit));
