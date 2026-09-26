@@ -404,9 +404,59 @@ pub fn rmsNorm(x_: Tensor, axis: anytype, eps: f32) Tensor {
     const ax = x_.axis(axis);
     // upcast to improve precision
     var x = x_.convert(.f32);
-    const variance = x.powByConst(2).mean(ax);
+    const variance = rmsNormMeanSquare(x, ax);
     const rsqrt = Tensor.rsqrt(variance.addConstant(eps));
     return x.mul(rsqrt.broad(x.shape())).convert(x_.dtype());
+}
+
+/// Mean square for RMSNorm. The reduction marker selects the safe GPU backend.
+pub fn rmsNormMeanSquare(x: Tensor, axis: anytype) Tensor {
+    const a = x.axis(axis);
+    const square = x.powByConst(2);
+    const sum = ops.reduceWithFrontendAttribute(.{square}, .{Tensor.constant(x.dtype().zero())}, &.{a}, struct {
+        pub fn acc(args: ops.ReduceArgs) struct { Tensor } {
+            return .{args.right.add(args.left.convert(args.right.dtype()))};
+        }
+    }.acc, .{}, "zml.rms_norm_reduction")[0];
+    return sum.divByConst(x.dim(a));
+}
+
+test "RMSNorm marks only its mean-square reduction" {
+    const platform = zml.testing.env();
+    const Local = struct {
+        fn call(x: Tensor) Tensor {
+            const normalized = rmsNorm(x, -1, 1e-6);
+            _ = x.powByConst(2).mean(-1);
+
+            const Counts = struct { marked: usize = 0, plain: usize = 0 };
+            var counts: Counts = .{};
+            zml.Compiler.current().module.operation().walk(.pre_order, &counts, struct {
+                fn visit(c: *Counts, op: *mlir.Operation) mlir.Operation.WalkResult {
+                    if (!std.mem.eql(u8, op.name(), "stablehlo.reduce")) return .advance;
+                    if (op.attributeByName("mhlo.frontend_attributes")) |attributes| {
+                        if (attributes.isA(mlir.DictionaryAttribute)) |dict| {
+                            if (dict.getByName("zml.rms_norm_reduction")) |marker| {
+                                if (marker.isA(mlir.StringAttribute)) |value| {
+                                    if (std.mem.eql(u8, value.value(), "1")) {
+                                        c.marked += 1;
+                                        return .advance;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    c.plain += 1;
+                    return .advance;
+                }
+            }.visit);
+            std.testing.expectEqual(@as(usize, 1), counts.marked) catch unreachable;
+            std.testing.expectEqual(@as(usize, 1), counts.plain) catch unreachable;
+            return normalized;
+        }
+    };
+
+    var exe = try platform.compileFn(std.testing.allocator, std.testing.io, Local.call, .{Tensor.init(.{ 2, 16 }, .bf16)}, .{});
+    defer exe.deinit();
 }
 
 /// Center and scale by the variance.
