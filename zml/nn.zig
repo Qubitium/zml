@@ -434,9 +434,15 @@ test "RMSNorm marks only its mean-square reduction" {
                 fn visit(c: *Counts, op: *mlir.Operation) mlir.Operation.WalkResult {
                     if (!std.mem.eql(u8, op.name(), "stablehlo.reduce")) return .advance;
                     if (op.attributeByName("mhlo.frontend_attributes")) |attributes| {
-                        if (attributes.isA(mlir.DictionaryAttribute).?.getByName("zml.rms_norm_reduction") != null) {
-                            c.marked += 1;
-                            return .advance;
+                        if (attributes.isA(mlir.DictionaryAttribute)) |dict| {
+                            if (dict.getByName("zml.rms_norm_reduction")) |marker| {
+                                if (marker.isA(mlir.StringAttribute)) |value| {
+                                    if (std.mem.eql(u8, value.value(), "1")) {
+                                        c.marked += 1;
+                                        return .advance;
+                                    }
+                                }
+                            }
                         }
                     }
                     c.plain += 1;
